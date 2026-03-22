@@ -94,7 +94,7 @@ func linkGenerator(jobs chan<- Job) {
     // ID1: cd19684beb903 (13 chars hex) -> Asumiremos una parte fija + random o fuerza bruta
     // ID2: 0000010850604 (13 chars numéricos)
     
-    fmt.Printf("%s[*] Generando combinaciones y probando...%s\n", ColorCyan, ColorReset))
+    fmt.Printf("%s[*] Generando combinaciones y probando...%s\n", ColorCyan, ColorReset)
 
     // Estrategia Híbrida: 
     // 1. Barrido Secuencial (Rápido para encontrar patrones)
