@@ -31,6 +31,8 @@ type CheckoutInfo struct {
 	Status      Status `json:"status"`
 	Method      string `json:"payment_method"`
 	Price       string `json:"price,omitempty"`
+	InvoiceID   string `json:"invoice_id,omitempty"`
+	OrderStatus string `json:"order_status,omitempty"`
 	LastChecked string `json:"last_checked"`
 }
 
@@ -39,11 +41,26 @@ type Config struct {
 	BearerToken string `json:"bearer_token"`
 }
 
-// Respuesta de la API de resellme
-type ResellmeInvoice struct {
-	Status string `json:"status"` // "completed", "pending", "expired", etc.
-	Error  string `json:"error,omitempty"`
-	// Añade más campos si la API devuelve más datos útiles
+// Respuesta de Sellix API
+type SellixResponse struct {
+	Status int `json:"status"`
+	Data   struct {
+		Invoice struct {
+			Uniqid       string  `json:"uniqid"`
+			Status       string  `json:"status"`
+			TotalDisplay float64 `json:"total_display"`
+			Currency     string  `json:"currency"`
+			Gateway      string  `json:"gateway"`
+		} `json:"invoice"`
+		Order struct {
+			Uniqid       string  `json:"uniqid"`
+			Status       string  `json:"status"`
+			TotalDisplay float64 `json:"total_display"`
+			Currency     string  `json:"currency"`
+			Gateway      string  `json:"gateway"`
+		} `json:"order"`
+	} `json:"data"`
+	Error string `json:"error"`
 }
 
 // ──────────────────────────────────────────
@@ -61,15 +78,6 @@ const (
 	httpTimeout = 12 * time.Second
 	maxWorkers  = 10
 )
-
-// Señales de página muerta en HTML (fallback si la API falla)
-var invalidSignals = []string{
-	"factura no encontrada",
-	"invoice not found",
-	"order not found",
-	"404",
-	"not found",
-}
 
 // ──────────────────────────────────────────
 //  Estado global
@@ -131,7 +139,7 @@ func main() {
 }
 
 // ──────────────────────────────────────────
-//  HTTP client (con proxy si hay)
+//  HTTP client
 // ──────────────────────────────────────────
 
 func newClient() *http.Client {
@@ -158,16 +166,38 @@ func newClient() *http.Client {
 
 // ──────────────────────────────────────────
 //  Extrae el invoice ID de la URL
-//  Ejemplo: https://resellme.xyz/checkout/6201d27b63af0-0000010143560
-//           → 6201d27b63af0-0000010143560
 // ──────────────────────────────────────────
 
 func extractInvoiceID(rawURL string) string {
 	parts := strings.Split(strings.TrimRight(rawURL, "/"), "/")
 	if len(parts) > 0 {
-		return parts[len(parts)-1]
+		last := parts[len(parts)-1]
+		if last != "" {
+			return last
+		}
 	}
 	return ""
+}
+
+// ──────────────────────────────────────────
+//  Hace un GET y devuelve body + status code
+// ──────────────────────────────────────────
+
+func doGet(client *http.Client, rawURL string, headers map[string]string) ([]byte, int, error) {
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return body, resp.StatusCode, err
 }
 
 // ──────────────────────────────────────────
@@ -189,136 +219,191 @@ func checkURL(rawURL string) {
 		return
 	}
 
-	// ── 1. Intentar API de resellme ───────────────────────────
-	// Probamos los endpoints más comunes de APIs de tiendas similares
-	apiEndpoints := []string{
-		fmt.Sprintf("https://resellme.xyz/api/invoice/%s", invoiceID),
-		fmt.Sprintf("https://resellme.xyz/api/checkout/%s", invoiceID),
-		fmt.Sprintf("https://resellme.xyz/api/order/%s", invoiceID),
-	}
-
 	client := newClient()
 	now := time.Now().Format(time.RFC3339)
 
-	for _, apiURL := range apiEndpoints {
-		req, err := http.NewRequest("GET", apiURL, nil)
+	baseHeaders := map[string]string{
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+		"Accept":     "application/json",
+		"Referer":    rawURL,
+	}
+
+	// Añadir auth si está configurada
+	if cfg.BearerToken != "" && cfg.BearerToken != "AQUI_PON_TU_TOKEN_SI_ES_BEARER" {
+		baseHeaders["Authorization"] = "Bearer " + cfg.BearerToken
+	} else if cfg.APIKey != "" && cfg.APIKey != "AQUI_PON_TU_API_KEY" {
+		baseHeaders["Authorization"] = "Bearer " + cfg.APIKey
+	}
+
+	// ── 1. Sellix API (backend de ResellMe) ──────────────────
+	// ResellMe corre sobre Sellix. El endpoint público es:
+	// GET https://dev.sellix.io/v1/orders/{uniqid}
+	// Sin auth devuelve 401, pero con la API key del vendedor devuelve el estado.
+	// Sin API key intentamos de todas formas — algunos shops tienen órdenes públicas.
+	sellixURLs := []string{
+		fmt.Sprintf("https://dev.sellix.io/v1/orders/%s", invoiceID),
+		fmt.Sprintf("https://dev.sellix.io/v1/payments/%s", invoiceID),
+	}
+
+	for _, apiURL := range sellixURLs {
+		body, code, err := doGet(client, apiURL, baseHeaders)
 		if err != nil {
 			continue
 		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Referer", rawURL)
 
-		if cfg.BearerToken != "" && cfg.BearerToken != "AQUI_PON_TU_TOKEN_SI_ES_BEARER" {
-			req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
-		} else if cfg.APIKey != "" && cfg.APIKey != "AQUI_PON_TU_API_KEY" {
-			req.Header.Set("X-API-Key", cfg.APIKey)
+		if code == 404 {
+			markInvalid(rawURL, fmt.Sprintf("Sellix API 404: factura no existe (%s)", apiURL))
+			return
 		}
 
-		resp, err := client.Do(req)
-		if err != nil || resp.StatusCode == 404 {
-			if resp != nil {
-				resp.Body.Close()
+		if code == 200 {
+			status, gateway, price, currency := parseSellixBody(body)
+			if status != "" {
+				return handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now)
 			}
+		}
+		// 401/403 = necesita auth → seguir con siguiente método
+	}
+
+	// ── 2. ResellMe API interna ───────────────────────────────
+	resellmeURLs := []string{
+		fmt.Sprintf("https://resellme.xyz/api/invoices/%s", invoiceID),
+		fmt.Sprintf("https://resellme.xyz/api/orders/%s", invoiceID),
+		fmt.Sprintf("https://resellme.xyz/api/checkout/%s", invoiceID),
+	}
+
+	for _, apiURL := range resellmeURLs {
+		hdrs := map[string]string{
+			"User-Agent":        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+			"Accept":            "application/json",
+			"Referer":           rawURL,
+			"X-Requested-With": "XMLHttpRequest",
+		}
+		body, code, err := doGet(client, apiURL, hdrs)
+		if err != nil {
 			continue
 		}
-		defer resp.Body.Close()
+		bodyLower := strings.ToLower(string(body))
 
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		body := string(bodyBytes)
-		bodyLower := strings.ToLower(body)
+		if code == 404 {
+			markInvalid(rawURL, "ResellMe API: no encontrado")
+			return
+		}
 
-		// Intentar parsear JSON
-		var invoice ResellmeInvoice
-		if err := json.Unmarshal(bodyBytes, &invoice); err == nil {
-			switch strings.ToLower(invoice.Status) {
-			case "completed", "paid", "complete", "delivered":
-				info := CheckoutInfo{
-					URL:         rawURL,
-					Status:      StatusValid,
-					Method:      "Resellme",
-					Price:       "",
-					LastChecked: now,
-				}
+		if code == 200 {
+			if strings.Contains(bodyLower, `"completed"`) || strings.Contains(bodyLower, `"paid"`) ||
+				strings.Contains(bodyLower, "entregado") || strings.Contains(bodyLower, "delivered") {
 				bufMu.Lock()
-				validBuffer = append(validBuffer, info)
+				validBuffer = append(validBuffer, CheckoutInfo{
+					URL: rawURL, Status: StatusValid,
+					Method: "Resellme", InvoiceID: invoiceID, LastChecked: now,
+				})
 				bufMu.Unlock()
-				fmt.Printf("[VALID]   %s | estado API: %s\n", rawURL, invoice.Status)
+				fmt.Printf("[VALID]   %s | ResellMe API positiva\n", rawURL)
 				return
-			case "not found", "error", "invalid", "expired":
-				markInvalid(rawURL, fmt.Sprintf("estado API: %s", invoice.Status))
-				return
-			default:
-				markUnknown(rawURL, fmt.Sprintf("estado API desconocido: %s", invoice.Status))
+			}
+			if strings.Contains(bodyLower, "no encontrada") || strings.Contains(bodyLower, "not found") ||
+				strings.Contains(bodyLower, "invalid") {
+				markInvalid(rawURL, "ResellMe API: factura no encontrada")
 				return
 			}
 		}
-
-		// Si no es JSON válido pero responde, buscar señales en el texto
-		if resp.StatusCode == 200 {
-			for _, sig := range invalidSignals {
-				if strings.Contains(bodyLower, sig) {
-					markInvalid(rawURL, fmt.Sprintf("señal en API: %q", sig))
-					return
-				}
-			}
-			// Responde 200 sin señales negativas → probablemente válido
-			if strings.Contains(bodyLower, "completed") || strings.Contains(bodyLower, "entregado") || strings.Contains(bodyLower, "paid") {
-				info := CheckoutInfo{
-					URL:         rawURL,
-					Status:      StatusValid,
-					Method:      "Resellme",
-					LastChecked: now,
-				}
-				bufMu.Lock()
-				validBuffer = append(validBuffer, info)
-				bufMu.Unlock()
-				fmt.Printf("[VALID]   %s | señal positiva en body\n", rawURL)
-				return
-			}
-		}
-		_ = body
 	}
 
-	// ── 2. Fallback: GET a la página normal y buscar señales ──
-	// resellme es SPA, el HTML estático no tendrá contenido dinámico,
-	// pero a veces devuelve datos en meta tags o el status HTTP
-	req, err := http.NewRequest("GET", rawURL, nil)
+	// ── 3. Fallback: GET página HTML y buscar señales SSR ─────
+	htmlHdrs := map[string]string{
+		"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+	}
+	body, code, err := doGet(client, rawURL, htmlHdrs)
 	if err != nil {
-		markUnknown(rawURL, "URL inválida")
-		return
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("[DEAD]   %s | %v\n", rawURL, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 404 || resp.StatusCode == 410 {
-		markInvalid(rawURL, fmt.Sprintf("HTTP %d", resp.StatusCode))
+		fmt.Printf("[DEAD]    %s | %v\n", rawURL, err)
 		return
 	}
 
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	bodyLower := strings.ToLower(string(bodyBytes))
+	if code == 404 || code == 410 {
+		markInvalid(rawURL, fmt.Sprintf("HTTP %d", code))
+		return
+	}
 
-	for _, sig := range invalidSignals {
+	bodyLower := strings.ToLower(string(body))
+
+	negatives := []string{"factura no encontrada", "invoice not found", "order not found", "checkout expired"}
+	for _, sig := range negatives {
 		if strings.Contains(bodyLower, sig) {
 			markInvalid(rawURL, fmt.Sprintf("señal HTML: %q", sig))
 			return
 		}
 	}
 
-	// SPA cargó bien pero no podemos leer el estado sin JS
-	markUnknown(rawURL, "SPA sin API accesible — requiere ejecución JS")
+	positives := []string{"completed", "entregado", "su pedido se ha realizado", "order completed", "paid"}
+	for _, sig := range positives {
+		if strings.Contains(bodyLower, sig) {
+			bufMu.Lock()
+			validBuffer = append(validBuffer, CheckoutInfo{
+				URL: rawURL, Status: StatusValid,
+				Method: "Resellme", InvoiceID: invoiceID, LastChecked: now,
+			})
+			bufMu.Unlock()
+			fmt.Printf("[VALID]   %s | señal HTML: %q\n", rawURL, sig)
+			return
+		}
+	}
+
+	// SPA pura — no se puede determinar sin JS
+	// SOLUCIÓN: pon tu API key de Sellix (del vendedor) en config.json como bearer_token
+	markUnknown(rawURL, "SPA pura. SOLUCIÓN: pon la API key de Sellix del vendedor en config.json como bearer_token")
 }
 
 // ──────────────────────────────────────────
-//  Helpers de estado
+//  Parsea respuesta Sellix y devuelve campos clave
+// ──────────────────────────────────────────
+
+func parseSellixBody(body []byte) (status, gateway, price, currency string) {
+	var result SellixResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return
+	}
+	// Puede estar en .data.invoice o .data.order
+	if result.Data.Invoice.Status != "" {
+		inv := result.Data.Invoice
+		status = strings.ToUpper(inv.Status)
+		gateway = inv.Gateway
+		price = fmt.Sprintf("%.2f", inv.TotalDisplay)
+		currency = inv.Currency
+	} else if result.Data.Order.Status != "" {
+		ord := result.Data.Order
+		status = strings.ToUpper(ord.Status)
+		gateway = ord.Gateway
+		price = fmt.Sprintf("%.2f", ord.TotalDisplay)
+		currency = ord.Currency
+	}
+	return
+}
+
+func handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now string) error {
+	priceStr := fmt.Sprintf("%s %s", price, currency)
+	switch status {
+	case "COMPLETED":
+		bufMu.Lock()
+		validBuffer = append(validBuffer, CheckoutInfo{
+			URL: rawURL, Status: StatusValid,
+			Method: gateway, Price: priceStr,
+			InvoiceID: invoiceID, OrderStatus: status, LastChecked: now,
+		})
+		bufMu.Unlock()
+		fmt.Printf("[VALID]   %s | %s | %s | %s\n", rawURL, status, gateway, priceStr)
+	case "VOIDED", "CANCELLED", "EXPIRED":
+		markInvalid(rawURL, fmt.Sprintf("Sellix status: %s", status))
+	default:
+		markUnknown(rawURL, fmt.Sprintf("Sellix status: %s", status))
+	}
+	return nil
+}
+
+// ──────────────────────────────────────────
+//  Helpers
 // ──────────────────────────────────────────
 
 func markInvalid(rawURL, reason string) {
@@ -333,32 +418,6 @@ func markUnknown(rawURL, reason string) {
 	unknownBuffer = append(unknownBuffer, rawURL)
 	bufMu.Unlock()
 	fmt.Printf("[UNKNOWN] %s | %s\n", rawURL, reason)
-}
-
-// ──────────────────────────────────────────
-//  Extracción de precio
-// ──────────────────────────────────────────
-
-func extractPrice(body string) string {
-	indicators := []string{"$", "€", "£", "usd", "eur", "gbp"}
-	for _, ind := range indicators {
-		idx := strings.Index(body, ind)
-		if idx == -1 {
-			continue
-		}
-		end := idx + 15
-		if end > len(body) {
-			end = len(body)
-		}
-		snippet := strings.TrimSpace(body[idx:end])
-		if i := strings.IndexAny(snippet, " \n\r\t<"); i > 0 {
-			snippet = snippet[:i]
-		}
-		if len(snippet) > 1 {
-			return snippet
-		}
-	}
-	return ""
 }
 
 // ──────────────────────────────────────────
@@ -390,7 +449,7 @@ func flushBuffers() {
 }
 
 // ──────────────────────────────────────────
-//  Carga de config y proxies
+//  Config y proxies
 // ──────────────────────────────────────────
 
 func loadConfig() {
