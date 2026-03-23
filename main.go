@@ -1,241 +1,234 @@
 package main
 
 import (
-    "bufio"
-    "encoding/json"
-    "fmt"
-    "io"
-    "math/rand"
-    "net/http"
-    "net/url"
-    "os"
-    "strings"
-    "sync"
-    "time"
+	"bufio"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
 )
 
-type Config struct {
-    ApiKey      string `json:"api_key"`
-    BearerToken string `json:"bearer_token"`
-}
-
-var appConfig Config
-
-const (
-    ColorReset  = "\033[0m"
-    ColorRed    = "\033[31m"
-    ColorGreen  = "\033[32m"
-    ColorYellow = "\033[33m"
-    ColorCyan   = "\033[36m"
-    ColorWhite  = "\033[97m"
-)
+const baseURL = "https://resellme.xyz/checkout/"
 
 var (
-    validCount   int
-    invalidCount int
-    retries      int
-    mu           sync.Mutex
+	validCount   int
+	invalidCount int
+	retryCount   int
+
+	mu sync.Mutex
+
+	// anti-duplicados en memoria
+	seenLinks sync.Map
+	savedSet  sync.Map
+
+	// pool dinámico de id1
+	id1Pool = []string{
+		"cd19684beb903",
+		"77b6e436f9eab",
+		"16efd1b037478",
+	}
 )
 
-type Job struct {
-    Link string
-}
-
+// ---------------- MAIN ----------------
 func main() {
-    rand.Seed(time.Now().UnixNano())
-    startTime := time.Now()
+	rand.Seed(time.Now().UnixNano())
 
-    loadConfig()
-    proxies, _ := loadLines("proxies.txt")
-    if len(proxies) == 0 {
-        fmt.Println(string(ColorYellow), "[!] MODO SIN PROXY: Usando tu IP real. Cuidado con el bloqueo.", string(ColorReset))
-    } else {
-        fmt.Printf("%s[*] %d proxies cargados.%s\n", ColorCyan, len(proxies), ColorReset)
-    }
+	proxies, _ := loadLines("proxies.txt")
 
-    jobs := make(chan Job, 2000)
-    var wg sync.WaitGroup
+	jobs := make(chan string, 2000)
 
-    numWorkers := 50
-    fmt.Printf("%s[*] Iniciando %d Workers...%s\n", ColorCyan, numWorkers, ColorReset)
-    for i := 0; i < numWorkers; i++ {
-        wg.Add(1)
-        go worker(jobs, &wg, proxies)
-    }
+	// 🔥 workers balanceados
+	for i := 0; i < 25; i++ {
+		go worker(jobs, proxies)
+	}
 
-    go linkGenerator(jobs)
-    go uiManager(startTime)
+	go generator(jobs)
+	go stats()
 
-    wg.Wait()
+	select {}
 }
 
-// ----------------------- Generador de links -----------------------
-func linkGenerator(jobs chan<- Job) {
-    baseURL := "https://resellme.xyz/checkout/"
-    currentNum := int64(1000000000000)
+// ---------------- GENERATOR ----------------
+func generator(jobs chan<- string) {
+	for {
+		id1 := getRandomID1()
+		id2 := fmt.Sprintf("%013d", rand.Int63n(2000000000000))
 
-    for {
-        id2 := fmt.Sprintf("%013d", currentNum)
-        id1 := randomHex(13)
-        fullLink := fmt.Sprintf("%s%s-%s", baseURL, id1, id2)
+		link := baseURL + id1 + "-" + id2
 
-        jobs <- Job{Link: fullLink}
-        currentNum++
-        if currentNum > 1999999999999 {
-            currentNum = 1000000000000
-        }
-    }
+		// evitar duplicados
+		if _, exists := seenLinks.Load(link); exists {
+			continue
+		}
+		seenLinks.Store(link, true)
+
+		jobs <- link
+	}
 }
 
-// ----------------------- Worker -----------------------
-func worker(jobs <-chan Job, wg *sync.WaitGroup, proxies []string) {
-    defer wg.Done()
-    for job := range jobs {
-        checkLink(job.Link, proxies)
-    }
+// ---------------- WORKER ----------------
+func worker(jobs chan string, proxies []string) {
+	for link := range jobs {
+
+		proxy := getProxy(proxies)
+		status := check(link, proxy)
+
+		switch status {
+		case "VALID":
+			saveUnique("valid.txt", link)
+			saveUnique("checkout.txt", link) // 🔥 NUEVO
+			extractID1(link)
+
+		case "RETRY":
+			time.Sleep(2 * time.Second)
+			jobs <- link
+		}
+
+		// delay anti-ban
+		time.Sleep(time.Duration(rand.Intn(200)+100) * time.Millisecond)
+	}
 }
 
-// ----------------------- Chequeo de link -----------------------
-func checkLink(link string, proxies []string) {
-    transport := &http.Transport{}
-    if len(proxies) > 0 {
-        proxyStr := proxies[rand.Intn(len(proxies))]
-        proxyURL, err := url.Parse(proxyStr)
-        if err == nil {
-            transport.Proxy = http.ProxyURL(proxyURL)
-        }
-    }
+// ---------------- CHECK ----------------
+func check(link string, proxy string) string {
 
-    client := &http.Client{
-        Timeout:   10 * time.Second,
-        Transport: transport,
-        CheckRedirect: func(req *http.Request, via []*http.Request) error {
-            return http.ErrUseLastResponse
-        },
-    }
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
 
-    req, err := http.NewRequest("GET", link, nil)
-    if err != nil {
-        return
-    }
+	if proxy != "" {
+		p, err := url.Parse(proxy)
+		if err == nil {
+			client.Transport = &http.Transport{
+				Proxy: http.ProxyURL(p),
+			}
+		}
+	}
 
-    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-    req.Header.Set("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
-    req.Header.Set("Referer", "https://resellme.xyz/")
-    
-    if appConfig.ApiKey != "" {
-        req.Header.Set("Authorization", "Bearer "+appConfig.ApiKey)
-    }
+	req, _ := http.NewRequest("GET", link, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-    resp, err := client.Do(req)
-    if err != nil {
-        printResult(link, "RETRY", "Network Error")
-        return
-    }
-    defer resp.Body.Close()
+	resp, err := client.Do(req)
+	if err != nil {
+		log("RETRY", link)
+		return "RETRY"
+	}
+	defer resp.Body.Close()
 
-    bodyBytes, err := io.ReadAll(resp.Body)
-    if err != nil {
-        printResult(link, "RETRY", "Read Error")
-        return
-    }
-    bodyString := string(bodyBytes)
+	if resp.StatusCode == 429 {
+		log("RETRY", link)
+		return "RETRY"
+	}
 
-    if resp.StatusCode == 200 {
-        validKeywords := []string{
-            "checkout", "pagar", "comprar", "tarjeta", "paypal", "bitcoin",
-            "moneda", "cantidad", "total", "enviar", "confirmar", "datos de pago",
-            "metodo de pago", "procesar pago", "resellme", "factura", "producto",
-            "servicio", "precio", "impuesto", "descuento", "cupon", "usuario",
-            "cliente", "email", "telefono", "direccion", "pais", "ciudad",
-            "codigo postal", "nombre", "apellido", "empresa", "nit", "documento",
-            "terminos", "condiciones", "politica", "privacidad", "seguridad",
-            "certificado", "ssl", "https", "lock", "escudo", "proteger", "seguro",
-            "garantia", "devolucion", "reembolso", "soporte", "ayuda", "contacto",
-        }
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	body := strings.ToLower(string(bodyBytes))
 
-        found := false
-        lowerBody := strings.ToLower(bodyString)
-        for _, kw := range validKeywords {
-            if strings.Contains(lowerBody, kw) {
-                found = true
-                break
-            }
-        }
+	if resp.StatusCode == 200 {
+		if strings.Contains(body, "checkout") || strings.Contains(body, "pagar") {
+			log("VALID", link)
+			return "VALID"
+		}
+		log("INVALID", link)
+		return "INVALID"
+	}
 
-        if found {
-            printResult(link, "VALID", "Keyword match")
-        } else {
-            printResult(link, "INVALID", "No match")
-        }
-    } else {
-        printResult(link, "INVALID", fmt.Sprintf("HTTP %d", resp.StatusCode))
-    }
+	log("INVALID", link)
+	return "INVALID"
 }
 
-// ----------------------- Funciones auxiliares -----------------------
-func loadConfig() {
-    f, err := os.Open("config.json")
-    if err != nil {
-        return
-    }
-    defer f.Close()
-    json.NewDecoder(f).Decode(&appConfig)
+// ---------------- HELPERS ----------------
+func getProxy(proxies []string) string {
+	if len(proxies) == 0 {
+		return ""
+	}
+	return proxies[rand.Intn(len(proxies))]
 }
 
-func loadLines(filename string) ([]string, error) {
-    file, err := os.Open(filename)
-    if err != nil {
-        return nil, err
-    }
-    defer file.Close()
-
-    var lines []string
-    scanner := bufio.NewScanner(file)
-    for scanner.Scan() {
-        line := strings.TrimSpace(scanner.Text())
-        if line != "" {
-            lines = append(lines, line)
-        }
-    }
-    return lines, scanner.Err()
+func getRandomID1() string {
+	mu.Lock()
+	defer mu.Unlock()
+	return id1Pool[rand.Intn(len(id1Pool))]
 }
 
-func printResult(link, status, msg string) {
-    mu.Lock()
-    defer mu.Unlock()
-    switch status {
-    case "VALID":
-        validCount++
-        fmt.Printf("%s[VALID]%s %s - %s\n", ColorGreen, ColorReset, link, msg)
-    case "INVALID":
-        invalidCount++
-        fmt.Printf("%s[INVALID]%s %s - %s\n", ColorRed, ColorReset, link, msg)
-    case "RETRY":
-        retries++
-        fmt.Printf("%s[RETRY]%s %s - %s\n", ColorYellow, ColorReset, link, msg)
-    }
+// 🔥 aprende nuevos id1 automáticamente
+func extractID1(link string) {
+	parts := strings.Split(link, "/checkout/")
+	if len(parts) < 2 {
+		return
+	}
+	idPart := parts[1]
+	id1 := strings.Split(idPart, "-")[0]
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, v := range id1Pool {
+		if v == id1 {
+			return
+		}
+	}
+
+	id1Pool = append(id1Pool, id1)
+	saveUnique("id1.txt", id1)
 }
 
-func randomHex(n int) string {
-    letters := "0123456789abcdef"
-    result := make([]byte, n)
-    for i := range result {
-        result[i] = letters[rand.Intn(len(letters))]
-    }
-    return string(result)
+// ---------------- FILE ----------------
+func saveUnique(file, text string) {
+	key := file + "|" + text
+
+	if _, loaded := savedSet.LoadOrStore(key, true); loaded {
+		return
+	}
+
+	f, _ := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer f.Close()
+	f.WriteString(text + "\n")
 }
 
-func uiManager(start time.Time) {
-    for {
-        mu.Lock()
-        v := validCount
-        iv := invalidCount
-        r := retries
-        mu.Unlock()
-        elapsed := time.Since(start).Truncate(time.Second)
-        fmt.Printf("%s[STATS]%s V:%d | I:%d | R:%d | Tiempo: %s\n", ColorCyan, ColorReset, v, iv, r, elapsed)
-        time.Sleep(5 * time.Second)
-    }
+func loadLines(file string) ([]string, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, strings.TrimSpace(scanner.Text()))
+	}
+	return lines, nil
+}
+
+// ---------------- LOG ----------------
+func log(status, link string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	switch status {
+	case "VALID":
+		validCount++
+		fmt.Println("[VALID]", link)
+	case "INVALID":
+		invalidCount++
+	case "RETRY":
+		retryCount++
+	}
+}
+
+// ---------------- STATS ----------------
+func stats() {
+	for {
+		mu.Lock()
+		fmt.Printf("[STATS] V:%d I:%d R:%d | ID1:%d\n",
+			validCount, invalidCount, retryCount, len(id1Pool))
+		mu.Unlock()
+
+		time.Sleep(5 * time.Second)
+	}
 }
