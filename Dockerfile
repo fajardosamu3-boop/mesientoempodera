@@ -8,16 +8,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copiar módulos primero (caché de capas)
+# Copiar módulos
 COPY go.mod ./
 
 # Generar go.sum y descargar dependencias
 RUN go mod tidy && go mod download
 
-# Copiar el resto
+# Copiar el resto del código
 COPY . .
 
 # Compilar
-RUN go build -ldflags="-w -s" -o out main.go
+RUN go build -ldflags="-w -s" -o out .
 
 CMD ["./out"]
