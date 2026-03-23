@@ -16,24 +16,21 @@ var (
 
 	validSet   sync.Map
 	unknownSet sync.Map
-	deadSet    sync.Map
 
-	bufferMu        sync.Mutex
-	validBuffer     []string
-	unknownBuffer   []string
-	deadBuffer      []string
+	bufferMu      sync.Mutex
+	validBuffer   []string
+	unknownBuffer []string
 )
 
 const (
 	inputFile   = "targets.txt"
 	validFile   = "checkout.txt"
 	unknownFile = "unknown.txt"
-	deadFile    = "dead.txt"
 	checkDelay  = 30 * time.Second
 )
 
 func main() {
-	fmt.Println("[START] Monitor de checkouts")
+	fmt.Println("[START] Monitor de checkouts ultra pro (sin guardar dead)")
 
 	for {
 		targets, err := loadLines(inputFile)
@@ -44,7 +41,6 @@ func main() {
 		}
 
 		var wg sync.WaitGroup
-
 		for _, url := range targets {
 			wg.Add(1)
 			go func(u string) {
@@ -54,7 +50,6 @@ func main() {
 		}
 
 		wg.Wait()
-
 		flushBuffers()
 		fmt.Println("[WAIT] siguiente ciclo...")
 		time.Sleep(checkDelay)
@@ -70,7 +65,8 @@ func check(link string) {
 
 	resp, err := client.Get(link)
 	if err != nil {
-		markDead(link)
+		// DEAD no se guarda
+		fmt.Println("[DEAD]", link)
 		return
 	}
 	defer resp.Body.Close()
@@ -78,7 +74,17 @@ func check(link string) {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	body := strings.ToLower(string(bodyBytes))
 
-	// 🔥 señales fuertes de checkout real
+	// -------- MÉTODO 1: Scripts de pago --------
+	if strings.Contains(body, "js.stripe.com") || strings.Contains(body, "paypal.com/sdk/js") ||
+		strings.Contains(body, "crypto") || strings.Contains(body, "bitcoin") || strings.Contains(body, "ethereum") {
+		if _, ok := validSet.LoadOrStore(link, true); !ok {
+			addToBuffer(&validBuffer, link)
+			fmt.Println("[VALID]", link)
+		}
+		return
+	}
+
+	// -------- MÉTODO 2: Keywords débiles --------
 	strongSignals := []string{
 		"stripe",
 		"paypal",
@@ -91,7 +97,6 @@ func check(link string) {
 		"usdt",
 	}
 
-	// 🔥 señales débiles
 	weakSignals := []string{
 		"checkout",
 		"payment",
@@ -109,14 +114,12 @@ func check(link string) {
 			strong++
 		}
 	}
-
 	for _, s := range weakSignals {
 		if strings.Contains(body, s) {
 			weak++
 		}
 	}
 
-	// ---------------- DECISIÓN ----------------
 	if resp.StatusCode == 200 && (strong >= 1 || weak >= 3) {
 		if _, ok := validSet.LoadOrStore(link, true); !ok {
 			addToBuffer(&validBuffer, link)
@@ -125,6 +128,7 @@ func check(link string) {
 		return
 	}
 
+	// -------- UNKNOWN --------
 	if resp.StatusCode == 200 {
 		if _, ok := unknownSet.LoadOrStore(link, true); !ok {
 			addToBuffer(&unknownBuffer, link)
@@ -133,17 +137,11 @@ func check(link string) {
 		return
 	}
 
-	markDead(link)
+	// DEAD no se guarda
+	fmt.Println("[DEAD]", link)
 }
 
 // ---------------- HELPERS ----------------
-func markDead(link string) {
-	if _, ok := deadSet.LoadOrStore(link, true); !ok {
-		addToBuffer(&deadBuffer, link)
-		fmt.Println("[DEAD]", link)
-	}
-}
-
 func addToBuffer(buffer *[]string, text string) {
 	bufferMu.Lock()
 	defer bufferMu.Unlock()
@@ -163,11 +161,6 @@ func flushBuffers() {
 	if len(unknownBuffer) > 0 {
 		save(unknownFile, unknownBuffer)
 		unknownBuffer = nil
-	}
-
-	if len(deadBuffer) > 0 {
-		save(deadFile, deadBuffer)
-		deadBuffer = nil
 	}
 }
 
