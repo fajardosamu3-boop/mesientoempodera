@@ -14,19 +14,24 @@ import (
 var (
 	mu sync.Mutex
 
-	validSet sync.Map
-	deadSet  sync.Map
+	validSet   sync.Map
+	unknownSet sync.Map
+	deadSet    sync.Map
+
+	bufferMu        sync.Mutex
+	validBuffer     []string
+	unknownBuffer   []string
+	deadBuffer      []string
 )
 
-// ---------------- CONFIG ----------------
 const (
-	inputFile  = "targets.txt"
-	validFile  = "checkout.txt"
-	deadFile   = "dead.txt"
-	checkDelay = 30 * time.Second
+	inputFile   = "targets.txt"
+	validFile   = "checkout.txt"
+	unknownFile = "unknown.txt"
+	deadFile    = "dead.txt"
+	checkDelay  = 30 * time.Second
 )
 
-// ---------------- MAIN ----------------
 func main() {
 	fmt.Println("[START] Monitor de checkouts")
 
@@ -50,6 +55,7 @@ func main() {
 
 		wg.Wait()
 
+		flushBuffers()
 		fmt.Println("[WAIT] siguiente ciclo...")
 		time.Sleep(checkDelay)
 	}
@@ -64,6 +70,7 @@ func check(link string) {
 
 	resp, err := client.Get(link)
 	if err != nil {
+		markDead(link)
 		return
 	}
 	defer resp.Body.Close()
@@ -71,43 +78,96 @@ func check(link string) {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	body := strings.ToLower(string(bodyBytes))
 
-	// 🔥 detección real de pagos
-	paymentSignals := []string{
+	// 🔥 señales fuertes de checkout real
+	strongSignals := []string{
 		"stripe",
 		"paypal",
 		"card",
-		"credit card",
+		"credit",
 		"visa",
 		"mastercard",
-		"crypto",
 		"bitcoin",
 		"ethereum",
 		"usdt",
-		"wallet",
-		"payment",
-		"pago",
-		"checkout",
 	}
 
-	matches := 0
-	for _, s := range paymentSignals {
+	// 🔥 señales débiles
+	weakSignals := []string{
+		"checkout",
+		"payment",
+		"pago",
+		"form",
+		"input",
+		"button",
+	}
+
+	strong := 0
+	weak := 0
+
+	for _, s := range strongSignals {
 		if strings.Contains(body, s) {
-			matches++
+			strong++
 		}
 	}
 
-	if resp.StatusCode == 200 && matches >= 2 {
+	for _, s := range weakSignals {
+		if strings.Contains(body, s) {
+			weak++
+		}
+	}
+
+	// ---------------- DECISIÓN ----------------
+	if resp.StatusCode == 200 && (strong >= 1 || weak >= 3) {
 		if _, ok := validSet.LoadOrStore(link, true); !ok {
-			save(validFile, link)
+			addToBuffer(&validBuffer, link)
 			fmt.Println("[VALID]", link)
 		}
 		return
 	}
 
-	// marcar como muerto
+	if resp.StatusCode == 200 {
+		if _, ok := unknownSet.LoadOrStore(link, true); !ok {
+			addToBuffer(&unknownBuffer, link)
+			fmt.Println("[UNKNOWN]", link)
+		}
+		return
+	}
+
+	markDead(link)
+}
+
+// ---------------- HELPERS ----------------
+func markDead(link string) {
 	if _, ok := deadSet.LoadOrStore(link, true); !ok {
-		save(deadFile, link)
+		addToBuffer(&deadBuffer, link)
 		fmt.Println("[DEAD]", link)
+	}
+}
+
+func addToBuffer(buffer *[]string, text string) {
+	bufferMu.Lock()
+	defer bufferMu.Unlock()
+	*buffer = append(*buffer, text)
+}
+
+// cada ciclo flush de buffers a archivo
+func flushBuffers() {
+	bufferMu.Lock()
+	defer bufferMu.Unlock()
+
+	if len(validBuffer) > 0 {
+		save(validFile, validBuffer)
+		validBuffer = nil
+	}
+
+	if len(unknownBuffer) > 0 {
+		save(unknownFile, unknownBuffer)
+		unknownBuffer = nil
+	}
+
+	if len(deadBuffer) > 0 {
+		save(deadFile, deadBuffer)
+		deadBuffer = nil
 	}
 }
 
@@ -130,11 +190,13 @@ func loadLines(file string) ([]string, error) {
 	return lines, nil
 }
 
-func save(file, text string) {
+func save(file string, lines []string) {
 	mu.Lock()
 	defer mu.Unlock()
 
 	f, _ := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	defer f.Close()
-	f.WriteString(text + "\n")
+	for _, line := range lines {
+		f.WriteString(line + "\n")
+	}
 }
