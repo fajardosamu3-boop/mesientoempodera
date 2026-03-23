@@ -39,6 +39,13 @@ type Config struct {
 	BearerToken string `json:"bearer_token"`
 }
 
+// Respuesta de la API de resellme
+type ResellmeInvoice struct {
+	Status string `json:"status"` // "completed", "pending", "expired", etc.
+	Error  string `json:"error,omitempty"`
+	// Añade más campos si la API devuelve más datos útiles
+}
+
 // ──────────────────────────────────────────
 //  Configuración
 // ──────────────────────────────────────────
@@ -55,24 +62,13 @@ const (
 	maxWorkers  = 10
 )
 
-// Firmas de métodos de pago — busca en el HTML completo (lowercase)
-var paymentSignatures = map[string][]string{
-	"Stripe":    {"js.stripe.com", "stripe.com/v3", `"stripe"`, "data-stripe", "stripe-button", "stripe-js"},
-	"PayPal":    {"paypal.com/sdk/js", "paypalobjects.com", `"paypal"`, "data-paypal", "paypal-button"},
-	"Crypto":    {"coinbase.com/v2", "nowpayments.io", "coinpayments.net", "web3modal", "metamask", "ethereum", "bitcoin"},
-	"Shopify":   {"cdn.shopify.com", "shopify.com/s/files", "myshopify.com", "shopify-checkout"},
-	"Square":    {"squareup.com", "square.com/checkout"},
-	"Braintree": {"js.braintreegateway.com", "braintree-web"},
-	"Resellme":  {"resellme", "add-to-cart", "buy-now", "checkout-form", "payment-form", "place-order"},
-}
-
-// Señales de página muerta / sin stock
+// Señales de página muerta en HTML (fallback si la API falla)
 var invalidSignals = []string{
-	"404", "not found", "page not found", "this page doesn't exist",
-	"no longer available", "product unavailable", "out of stock",
-	"sold out", "this shop is closed", "store is closed",
-	"coming soon", "under construction", "checkout expired",
-	"order not found", "invalid checkout",
+	"factura no encontrada",
+	"invoice not found",
+	"order not found",
+	"404",
+	"not found",
 }
 
 // ──────────────────────────────────────────
@@ -161,6 +157,20 @@ func newClient() *http.Client {
 }
 
 // ──────────────────────────────────────────
+//  Extrae el invoice ID de la URL
+//  Ejemplo: https://resellme.xyz/checkout/6201d27b63af0-0000010143560
+//           → 6201d27b63af0-0000010143560
+// ──────────────────────────────────────────
+
+func extractInvoiceID(rawURL string) string {
+	parts := strings.Split(strings.TrimRight(rawURL, "/"), "/")
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
+	}
+	return ""
+}
+
+// ──────────────────────────────────────────
 //  Check de una URL
 // ──────────────────────────────────────────
 
@@ -173,27 +183,113 @@ func checkURL(rawURL string) {
 		return
 	}
 
-	client := newClient()
+	invoiceID := extractInvoiceID(rawURL)
+	if invoiceID == "" {
+		markUnknown(rawURL, "no se pudo extraer invoice ID")
+		return
+	}
 
+	// ── 1. Intentar API de resellme ───────────────────────────
+	// Probamos los endpoints más comunes de APIs de tiendas similares
+	apiEndpoints := []string{
+		fmt.Sprintf("https://resellme.xyz/api/invoice/%s", invoiceID),
+		fmt.Sprintf("https://resellme.xyz/api/checkout/%s", invoiceID),
+		fmt.Sprintf("https://resellme.xyz/api/order/%s", invoiceID),
+	}
+
+	client := newClient()
+	now := time.Now().Format(time.RFC3339)
+
+	for _, apiURL := range apiEndpoints {
+		req, err := http.NewRequest("GET", apiURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Referer", rawURL)
+
+		if cfg.BearerToken != "" && cfg.BearerToken != "AQUI_PON_TU_TOKEN_SI_ES_BEARER" {
+			req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+		} else if cfg.APIKey != "" && cfg.APIKey != "AQUI_PON_TU_API_KEY" {
+			req.Header.Set("X-API-Key", cfg.APIKey)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode == 404 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		body := string(bodyBytes)
+		bodyLower := strings.ToLower(body)
+
+		// Intentar parsear JSON
+		var invoice ResellmeInvoice
+		if err := json.Unmarshal(bodyBytes, &invoice); err == nil {
+			switch strings.ToLower(invoice.Status) {
+			case "completed", "paid", "complete", "delivered":
+				info := CheckoutInfo{
+					URL:         rawURL,
+					Status:      StatusValid,
+					Method:      "Resellme",
+					Price:       "",
+					LastChecked: now,
+				}
+				bufMu.Lock()
+				validBuffer = append(validBuffer, info)
+				bufMu.Unlock()
+				fmt.Printf("[VALID]   %s | estado API: %s\n", rawURL, invoice.Status)
+				return
+			case "not found", "error", "invalid", "expired":
+				markInvalid(rawURL, fmt.Sprintf("estado API: %s", invoice.Status))
+				return
+			default:
+				markUnknown(rawURL, fmt.Sprintf("estado API desconocido: %s", invoice.Status))
+				return
+			}
+		}
+
+		// Si no es JSON válido pero responde, buscar señales en el texto
+		if resp.StatusCode == 200 {
+			for _, sig := range invalidSignals {
+				if strings.Contains(bodyLower, sig) {
+					markInvalid(rawURL, fmt.Sprintf("señal en API: %q", sig))
+					return
+				}
+			}
+			// Responde 200 sin señales negativas → probablemente válido
+			if strings.Contains(bodyLower, "completed") || strings.Contains(bodyLower, "entregado") || strings.Contains(bodyLower, "paid") {
+				info := CheckoutInfo{
+					URL:         rawURL,
+					Status:      StatusValid,
+					Method:      "Resellme",
+					LastChecked: now,
+				}
+				bufMu.Lock()
+				validBuffer = append(validBuffer, info)
+				bufMu.Unlock()
+				fmt.Printf("[VALID]   %s | señal positiva en body\n", rawURL)
+				return
+			}
+		}
+		_ = body
+	}
+
+	// ── 2. Fallback: GET a la página normal y buscar señales ──
+	// resellme es SPA, el HTML estático no tendrá contenido dinámico,
+	// pero a veces devuelve datos en meta tags o el status HTTP
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		markUnknown(rawURL, "URL inválida")
 		return
 	}
-
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Cache-Control", "no-cache")
-
-	// Auth si está configurado
-	if cfg.BearerToken != "" && cfg.BearerToken != "AQUI_PON_TU_TOKEN_SI_ES_BEARER" {
-		req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
-	} else if cfg.APIKey != "" && cfg.APIKey != "AQUI_PON_TU_API_KEY" {
-		req.Header.Set("X-API-Key", cfg.APIKey)
-	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -202,61 +298,23 @@ func checkURL(rawURL string) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		markUnknown(rawURL, "error leyendo body")
-		return
-	}
-
-	body := strings.ToLower(string(bodyBytes))
-	now := time.Now().Format(time.RFC3339)
-
-	// ── 1. HTTP error duro → INVALID ─────────────────────────
 	if resp.StatusCode == 404 || resp.StatusCode == 410 {
 		markInvalid(rawURL, fmt.Sprintf("HTTP %d", resp.StatusCode))
 		return
 	}
 
-	// ── 2. Señales de página muerta en HTML → INVALID ────────
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	bodyLower := strings.ToLower(string(bodyBytes))
+
 	for _, sig := range invalidSignals {
-		if strings.Contains(body, sig) {
-			markInvalid(rawURL, fmt.Sprintf("señal: %q", sig))
+		if strings.Contains(bodyLower, sig) {
+			markInvalid(rawURL, fmt.Sprintf("señal HTML: %q", sig))
 			return
 		}
 	}
 
-	// ── 3. Detectar método de pago → VALID ───────────────────
-	method := ""
-	for name, sigs := range paymentSignatures {
-		for _, sig := range sigs {
-			if strings.Contains(body, sig) {
-				method = name
-				break
-			}
-		}
-		if method != "" {
-			break
-		}
-	}
-
-	if method != "" {
-		price := extractPrice(body)
-		info := CheckoutInfo{
-			URL:         rawURL,
-			Status:      StatusValid,
-			Method:      method,
-			Price:       price,
-			LastChecked: now,
-		}
-		bufMu.Lock()
-		validBuffer = append(validBuffer, info)
-		bufMu.Unlock()
-		fmt.Printf("[VALID]   %s | %s | precio: %s\n", rawURL, method, price)
-		return
-	}
-
-	// ── 4. Carga OK pero sin método de pago → UNKNOWN ────────
-	markUnknown(rawURL, "sin método de pago detectado")
+	// SPA cargó bien pero no podemos leer el estado sin JS
+	markUnknown(rawURL, "SPA sin API accesible — requiere ejecución JS")
 }
 
 // ──────────────────────────────────────────
