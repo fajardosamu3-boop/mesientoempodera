@@ -2,13 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/chromedp/chromedp"
 )
 
 var (
@@ -30,7 +31,7 @@ const (
 )
 
 func main() {
-	fmt.Println("[START] Monitor de checkouts ultra pro (sin guardar dead)")
+	fmt.Println("[START] Monitor ultra pro con Headless Chrome")
 
 	for {
 		targets, err := loadLines(inputFile)
@@ -59,86 +60,53 @@ func main() {
 // ---------------- CHECK ----------------
 func check(link string) {
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
+	// Create context with timeout
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+	ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 
-	resp, err := client.Get(link)
+	var htmlContent string
+
+	err := chromedp.Run(ctx,
+		chromedp.Navigate(link),
+		chromedp.Sleep(2*time.Second), // espera a que cargue JS
+		chromedp.OuterHTML("html", &htmlContent, chromedp.NodeVisible),
+	)
 	if err != nil {
-		// DEAD no se guarda
 		fmt.Println("[DEAD]", link)
 		return
 	}
-	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	body := strings.ToLower(string(bodyBytes))
+	body := strings.ToLower(htmlContent)
 
-	// -------- MÉTODO 1: Scripts de pago --------
-	if strings.Contains(body, "js.stripe.com") || strings.Contains(body, "paypal.com/sdk/js") ||
-		strings.Contains(body, "crypto") || strings.Contains(body, "bitcoin") || strings.Contains(body, "ethereum") {
-		if _, ok := validSet.LoadOrStore(link, true); !ok {
-			addToBuffer(&validBuffer, link)
-			fmt.Println("[VALID]", link)
-		}
-		return
-	}
-
-	// -------- MÉTODO 2: Keywords débiles --------
-	strongSignals := []string{
-		"stripe",
-		"paypal",
-		"card",
-		"credit",
-		"visa",
-		"mastercard",
+	// -------- VALID si scripts de pago detectados --------
+	paymentSignals := []string{
+		"js.stripe.com",
+		"paypal.com/sdk/js",
+		"crypto",
 		"bitcoin",
 		"ethereum",
 		"usdt",
+		"card",
+		"checkout-button",
 	}
 
-	weakSignals := []string{
-		"checkout",
-		"payment",
-		"pago",
-		"form",
-		"input",
-		"button",
-	}
-
-	strong := 0
-	weak := 0
-
-	for _, s := range strongSignals {
+	for _, s := range paymentSignals {
 		if strings.Contains(body, s) {
-			strong++
-		}
-	}
-	for _, s := range weakSignals {
-		if strings.Contains(body, s) {
-			weak++
+			if _, ok := validSet.LoadOrStore(link, true); !ok {
+				addToBuffer(&validBuffer, link)
+				fmt.Println("[VALID]", link)
+			}
+			return
 		}
 	}
 
-	if resp.StatusCode == 200 && (strong >= 1 || weak >= 3) {
-		if _, ok := validSet.LoadOrStore(link, true); !ok {
-			addToBuffer(&validBuffer, link)
-			fmt.Println("[VALID]", link)
-		}
-		return
+	// -------- UNKNOWN si HTML cargó pero sin señales --------
+	if _, ok := unknownSet.LoadOrStore(link, true); !ok {
+		addToBuffer(&unknownBuffer, link)
+		fmt.Println("[UNKNOWN]", link)
 	}
-
-	// -------- UNKNOWN --------
-	if resp.StatusCode == 200 {
-		if _, ok := unknownSet.LoadOrStore(link, true); !ok {
-			addToBuffer(&unknownBuffer, link)
-			fmt.Println("[UNKNOWN]", link)
-		}
-		return
-	}
-
-	// DEAD no se guarda
-	fmt.Println("[DEAD]", link)
 }
 
 // ---------------- HELPERS ----------------
@@ -148,7 +116,7 @@ func addToBuffer(buffer *[]string, text string) {
 	*buffer = append(*buffer, text)
 }
 
-// cada ciclo flush de buffers a archivo
+// flush de buffers a archivo
 func flushBuffers() {
 	bufferMu.Lock()
 	defer bufferMu.Unlock()
