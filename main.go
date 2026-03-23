@@ -259,7 +259,8 @@ func checkURL(rawURL string) {
 		if code == 200 {
 			status, gateway, price, currency := parseSellixBody(body)
 			if status != "" {
-				return handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now)
+				handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now)
+				return
 			}
 		}
 		// 401/403 = necesita auth → seguir con siguiente método
@@ -382,7 +383,7 @@ func parseSellixBody(body []byte) (status, gateway, price, currency string) {
 	return
 }
 
-func handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now string) error {
+func handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now string) {
 	priceStr := fmt.Sprintf("%s %s", price, currency)
 	switch status {
 	case "COMPLETED":
@@ -399,7 +400,6 @@ func handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now
 	default:
 		markUnknown(rawURL, fmt.Sprintf("Sellix status: %s", status))
 	}
-	return nil
 }
 
 // ──────────────────────────────────────────
