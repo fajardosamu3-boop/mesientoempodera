@@ -360,3 +360,4 @@ func checkLink(link string, proxies []string) {
             "gratis",
             "gratuito",
             "gratis",
+}
