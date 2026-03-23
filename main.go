@@ -69,6 +69,7 @@ func main() {
     wg.Wait()
 }
 
+// ----------------------- Generador de links -----------------------
 func linkGenerator(jobs chan<- Job) {
     baseURL := "https://resellme.xyz/checkout/"
     currentNum := int64(1000000000000)
@@ -77,7 +78,7 @@ func linkGenerator(jobs chan<- Job) {
         id2 := fmt.Sprintf("%013d", currentNum)
         id1 := randomHex(13)
         fullLink := fmt.Sprintf("%s%s-%s", baseURL, id1, id2)
-        
+
         jobs <- Job{Link: fullLink}
         currentNum++
         if currentNum > 1999999999999 {
@@ -86,14 +87,15 @@ func linkGenerator(jobs chan<- Job) {
     }
 }
 
+// ----------------------- Worker -----------------------
 func worker(jobs <-chan Job, wg *sync.WaitGroup, proxies []string) {
     defer wg.Done()
-
     for job := range jobs {
         checkLink(job.Link, proxies)
     }
 }
 
+// ----------------------- Chequeo de link -----------------------
 func checkLink(link string, proxies []string) {
     transport := &http.Transport{}
     if len(proxies) > 0 {
@@ -140,224 +142,100 @@ func checkLink(link string, proxies []string) {
     }
     bodyString := string(bodyBytes)
 
-    // Lógica de verificación corregida
     if resp.StatusCode == 200 {
-        // Palabras clave de checkout válido
         validKeywords := []string{
-            "checkout",
-            "pagar",
-            "comprar",
-            "tarjeta",
-            "paypal",
-            "bitcoin",
-            "moneda",
-            "cantidad",
-            "total",
-            "enviar",
-            "confirmar",
-            "datos de pago",
-            "metodo de pago",
-            "procesar pago",
-            "resellme",
-            "factura",
-            "producto",
-            "servicio",
-            "precio",
-            "impuesto",
-            "descuento",
-            "cupon",
-            "usuario",
-            "cliente",
-            "email",
-            "telefono",
-            "direccion",
-            "pais",
-            "ciudad",
-            "codigo postal",
-            "nombre",
-            "apellido",
-            "empresa",
-            "nit",
-            "documento",
-            "terminos",
-            "condiciones",
-            "politica",
-            "privacidad",
-            "seguridad",
-            "certificado",
-            "ssl",
-            "https",
-            "lock",
-            "escudo",
-            "proteger",
-            "seguro",
-            "garantia",
-            "devolucion",
-            "reembolso",
-            "soporte",
-            "ayuda",
-            "contacto",
-            "faq",
-            "preguntas",
-            "frecuentes",
-            "guias",
-            "tutoriales",
-            "blog",
-            "noticias",
-            "actualizaciones",
-            "novedades",
-            "ofertas",
-            "promociones",
-            "descuentos",
-            "cupones",
-            "cashback",
-            "recompensas",
-            "puntos",
-            "fidelidad",
-            "mi cuenta",
-            "historial",
-            "pedidos",
-            "compras",
-            "favoritos",
-            "wishlist",
-            "carrito",
-            "cesta",
-            "checkout",
-            "pagar",
-            "comprar",
-            "finalizar",
-            "completar",
-            "procesar",
-            "confirmar",
-            "aceptar",
-            "acepto",
-            "entendido",
-            "continuar",
-            "siguiente",
-            "anterior",
-            "atras",
-            "inicio",
-            "home",
-            "menu",
-            "categorias",
-            "buscador",
-            "buscar",
-            "filtrar",
-            "ordenar",
-            "precio",
-            "mas vendidos",
-            "nuevos",
-            "ofertas",
-            "destacados",
-            "relacionados",
-            "similares",
-            "comentarios",
-            "reseñas",
-            "calificaciones",
-            "estrellas",
-            "puntuacion",
-            "valoracion",
-            "opinion",
-            "feedback",
-            "sugerencias",
-            "reclamos",
-            "quejas",
-            "felicitaciones",
-            "agradecimientos",
-            "testimonios",
-            "casos de exito",
-            "clientes",
-            "usuarios",
-            "miembros",
-            "suscriptores",
-            "seguidores",
-            "fans",
-            "comunidad",
-            "grupo",
-            "foro",
-            "chat",
-            "mensajes",
-            "notificaciones",
-            "alertas",
-            "recordatorios",
-            "cumpleanos",
-            "celebraciones",
-            "eventos",
-            "promociones",
-            "descuentos",
-            "ofertas",
-            "liquidacion",
-            "rebajas",
-            "venta",
-            "compra",
-            "transaccion",
-            "pago",
-            "cobro",
-            "factura",
-            "recibo",
-            "ticket",
-            "comprobante",
-            "orden",
-            "pedido",
-            "envio",
-            "entrega",
-            "direccion",
-            "destino",
-            "origen",
-            "transporte",
-            "logistica",
-            "mensajeria",
-            "courier",
-            "paqueteria",
-            "paquete",
-            "bulto",
-            "caja",
-            "embalaje",
-            "empaque",
-            "etiquetado",
-            "marcas",
-            "etiquetas",
-            "codigo de barras",
-            "qr",
-            "rfid",
-            "inventario",
-            "stock",
-            "existencias",
-            "disponibilidad",
-            "agotado",
-            "agotamiento",
-            "reabastecer",
-            "pedir",
-            "solicitar",
-            "reservar",
-            "preordenar",
-            "esperar",
-            "disponible",
-            "en stock",
-            "listo",
-            "preparado",
-            "enviado",
-            "entregado",
-            "recibido",
-            "firmado",
-            "confirmado",
-            "aceptado",
-            "rechazado",
-            "cancelado",
-            "anulado",
-            "devuelto",
-            "reembolsado",
-            "reversado",
-            "reintegrado",
-            "compensado",
-            "bonificado",
-            "regalado",
-            "gratis",
-            "gratis",
-            "gratuito",
-            "sin costo",
-            "gratis",
-            "gratis",
-            "gratuito",
-            "gratis",
+            "checkout", "pagar", "comprar", "tarjeta", "paypal", "bitcoin",
+            "moneda", "cantidad", "total", "enviar", "confirmar", "datos de pago",
+            "metodo de pago", "procesar pago", "resellme", "factura", "producto",
+            "servicio", "precio", "impuesto", "descuento", "cupon", "usuario",
+            "cliente", "email", "telefono", "direccion", "pais", "ciudad",
+            "codigo postal", "nombre", "apellido", "empresa", "nit", "documento",
+            "terminos", "condiciones", "politica", "privacidad", "seguridad",
+            "certificado", "ssl", "https", "lock", "escudo", "proteger", "seguro",
+            "garantia", "devolucion", "reembolso", "soporte", "ayuda", "contacto",
+        }
+
+        found := false
+        lowerBody := strings.ToLower(bodyString)
+        for _, kw := range validKeywords {
+            if strings.Contains(lowerBody, kw) {
+                found = true
+                break
+            }
+        }
+
+        if found {
+            printResult(link, "VALID", "Keyword match")
+        } else {
+            printResult(link, "INVALID", "No match")
+        }
+    } else {
+        printResult(link, "INVALID", fmt.Sprintf("HTTP %d", resp.StatusCode))
+    }
+}
+
+// ----------------------- Funciones auxiliares -----------------------
+func loadConfig() {
+    f, err := os.Open("config.json")
+    if err != nil {
+        return
+    }
+    defer f.Close()
+    json.NewDecoder(f).Decode(&appConfig)
+}
+
+func loadLines(filename string) ([]string, error) {
+    file, err := os.Open(filename)
+    if err != nil {
+        return nil, err
+    }
+    defer file.Close()
+
+    var lines []string
+    scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        line := strings.TrimSpace(scanner.Text())
+        if line != "" {
+            lines = append(lines, line)
+        }
+    }
+    return lines, scanner.Err()
+}
+
+func printResult(link, status, msg string) {
+    mu.Lock()
+    defer mu.Unlock()
+    switch status {
+    case "VALID":
+        validCount++
+        fmt.Printf("%s[VALID]%s %s - %s\n", ColorGreen, ColorReset, link, msg)
+    case "INVALID":
+        invalidCount++
+        fmt.Printf("%s[INVALID]%s %s - %s\n", ColorRed, ColorReset, link, msg)
+    case "RETRY":
+        retries++
+        fmt.Printf("%s[RETRY]%s %s - %s\n", ColorYellow, ColorReset, link, msg)
+    }
+}
+
+func randomHex(n int) string {
+    letters := "0123456789abcdef"
+    result := make([]byte, n)
+    for i := range result {
+        result[i] = letters[rand.Intn(len(letters))]
+    }
+    return string(result)
+}
+
+func uiManager(start time.Time) {
+    for {
+        mu.Lock()
+        v := validCount
+        iv := invalidCount
+        r := retries
+        mu.Unlock()
+        elapsed := time.Since(start).Truncate(time.Second)
+        fmt.Printf("%s[STATS]%s V:%d | I:%d | R:%d | Tiempo: %s\n", ColorCyan, ColorReset, v, iv, r, elapsed)
+        time.Sleep(5 * time.Second)
+    }
 }
