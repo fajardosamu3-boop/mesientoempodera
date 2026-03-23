@@ -2,16 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math/rand"
-	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 )
 
 // ──────────────────────────────────────────
@@ -29,38 +29,10 @@ const (
 type CheckoutInfo struct {
 	URL         string `json:"url"`
 	Status      Status `json:"status"`
-	Method      string `json:"payment_method"`
 	Price       string `json:"price,omitempty"`
 	InvoiceID   string `json:"invoice_id,omitempty"`
 	OrderStatus string `json:"order_status,omitempty"`
 	LastChecked string `json:"last_checked"`
-}
-
-type Config struct {
-	APIKey      string `json:"api_key"`
-	BearerToken string `json:"bearer_token"`
-}
-
-// Respuesta de Sellix API
-type SellixResponse struct {
-	Status int `json:"status"`
-	Data   struct {
-		Invoice struct {
-			Uniqid       string  `json:"uniqid"`
-			Status       string  `json:"status"`
-			TotalDisplay float64 `json:"total_display"`
-			Currency     string  `json:"currency"`
-			Gateway      string  `json:"gateway"`
-		} `json:"invoice"`
-		Order struct {
-			Uniqid       string  `json:"uniqid"`
-			Status       string  `json:"status"`
-			TotalDisplay float64 `json:"total_display"`
-			Currency     string  `json:"currency"`
-			Gateway      string  `json:"gateway"`
-		} `json:"order"`
-	} `json:"data"`
-	Error string `json:"error"`
 }
 
 // ──────────────────────────────────────────
@@ -72,12 +44,39 @@ const (
 	jsonFile    = "checkout.json"
 	unknownFile = "unknown.txt"
 	invalidFile = "invalid.txt"
-	proxiesFile = "proxies.txt"
-	configFile  = "config.json"
 	checkDelay  = 30 * time.Second
-	httpTimeout = 12 * time.Second
-	maxWorkers  = 10
+	pageTimeout = 25 * time.Second
+	maxWorkers  = 2 // chromedp es pesado
 )
+
+// Señales en el body de la página renderizada
+var invalidBodySignals = []string{
+	"factura no encontrada",
+	"invoice not found",
+	"no encontrada",
+	"not found",
+	"checkout expired",
+}
+
+var validBodySignals = []string{
+	"su pedido se ha realizado correctamente",
+	"order has been placed",
+	"entregado",
+	"delivered",
+	"thank you for shopping",
+	"gracias por",
+}
+
+// Señales en respuestas JSON de red interceptadas
+var invalidAPISignals = []string{
+	`"not_found"`, `"VOIDED"`, `"CANCELLED"`, `"EXPIRED"`,
+	`"error"`, `"not found"`, `"invalid"`,
+}
+
+var validAPISignals = []string{
+	`"COMPLETED"`, `"completed"`, `"PAID"`, `"paid"`,
+	`"delivered"`, `"DELIVERED"`,
+}
 
 // ──────────────────────────────────────────
 //  Estado global
@@ -92,9 +91,6 @@ var (
 	unknownBuffer []string
 
 	fileMu sync.Mutex
-
-	proxies []string
-	cfg     Config
 )
 
 // ──────────────────────────────────────────
@@ -102,10 +98,7 @@ var (
 // ──────────────────────────────────────────
 
 func main() {
-	fmt.Println("[START] Checkout Monitor – VALID / INVALID / UNKNOWN")
-
-	loadConfig()
-	loadProxies()
+	fmt.Println("[START] Checkout Monitor (chromedp) – VALID / INVALID / UNKNOWN")
 
 	for {
 		seen = sync.Map{}
@@ -139,33 +132,209 @@ func main() {
 }
 
 // ──────────────────────────────────────────
-//  HTTP client
+//  Check con chromedp + intercepción de red
 // ──────────────────────────────────────────
 
-func newClient() *http.Client {
-	transport := &http.Transport{}
+func checkURL(rawURL string) {
+	if !strings.HasPrefix(rawURL, "http") {
+		rawURL = "https://" + rawURL
+	}
+	if _, loaded := seen.LoadOrStore(rawURL, true); loaded {
+		return
+	}
 
-	if len(proxies) > 0 {
-		proxy := proxies[rand.Intn(len(proxies))]
-		if proxyURL, err := url.Parse(proxy); err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
+	invoiceID := extractInvoiceID(rawURL)
+	now := time.Now().Format(time.RFC3339)
+
+	// Opciones headless — funciona en Linux sin display
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("ignore-certificate-errors", true),
+		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+	)
+
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancelAlloc()
+
+	ctx, cancelCtx := chromedp.NewContext(allocCtx)
+	defer cancelCtx()
+
+	ctx, cancelTimeout := context.WithTimeout(ctx, pageTimeout)
+	defer cancelTimeout()
+
+	// Mapa para capturar respuestas de red
+	// key = requestID, value = responseBody string
+	var netMu sync.Mutex
+	capturedBodies := make(map[network.RequestID]string)
+	capturedURLs := make(map[network.RequestID]string)
+
+	// Escuchar eventos de red ANTES de navegar
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		switch e := ev.(type) {
+
+		case *network.EventResponseReceived:
+			url := e.Response.URL
+			// Solo nos interesan llamadas a APIs (JSON), no assets
+			if strings.Contains(url, "/api/") ||
+				strings.Contains(url, "sellix") ||
+				strings.Contains(url, "invoice") ||
+				strings.Contains(url, "order") ||
+				strings.Contains(url, "checkout") {
+				netMu.Lock()
+				capturedURLs[e.RequestID] = url
+				netMu.Unlock()
+				fmt.Printf("[NET] %s → HTTP %d | %s\n", invoiceID, e.Response.Status, url)
+			}
+
+		case *network.EventLoadingFinished:
+			netMu.Lock()
+			url, ok := capturedURLs[e.RequestID]
+			netMu.Unlock()
+			if !ok {
+				return
+			}
+			// Obtener el body de esta respuesta en una goroutine
+			go func(reqID network.RequestID, reqURL string) {
+				// Necesitamos un contexto nuevo derivado (no el cancelado)
+				getCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+
+				var body []byte
+				err := chromedp.Run(getCtx,
+					chromedp.ActionFunc(func(c context.Context) error {
+						var err error
+						body, err = network.GetResponseBody(reqID).Do(c)
+						return err
+					}),
+				)
+				if err != nil {
+					return
+				}
+
+				bodyStr := string(body)
+				if len(bodyStr) > 500 {
+					fmt.Printf("[API]  %s → %q...\n", reqURL, bodyStr[:500])
+				} else {
+					fmt.Printf("[API]  %s → %q\n", reqURL, bodyStr)
+				}
+
+				netMu.Lock()
+				capturedBodies[reqID] = bodyStr
+				netMu.Unlock()
+			}(e.RequestID, url)
+		}
+	})
+
+	// Navegar y esperar a que el JS renderice
+	var bodyText string
+	err := chromedp.Run(ctx,
+		network.Enable(),
+		chromedp.Navigate(rawURL),
+		chromedp.Sleep(4*time.Second), // esperar renderizado JS
+		chromedp.Text("body", &bodyText, chromedp.ByQuery),
+	)
+
+	if err != nil {
+		fmt.Printf("[DEAD]    %s | %v\n", rawURL, err)
+		markUnknown(rawURL, "error cargando página")
+		return
+	}
+
+	// Dar tiempo a que terminen las goroutines de captura
+	time.Sleep(1 * time.Second)
+
+	bodyLower := strings.ToLower(bodyText)
+	preview := bodyLower
+	if len(preview) > 400 {
+		preview = preview[:400]
+	}
+	fmt.Printf("[PAGE] %s\n  body: %q\n", rawURL, preview)
+
+	// ── 1. Analizar respuestas de API capturadas ──────────────
+	netMu.Lock()
+	bodies := make([]string, 0, len(capturedBodies))
+	for _, b := range capturedBodies {
+		bodies = append(bodies, b)
+	}
+	netMu.Unlock()
+
+	for _, apiBody := range bodies {
+		apiLower := strings.ToLower(apiBody)
+
+		// Primero señales INVALID en API
+		for _, sig := range invalidAPISignals {
+			if strings.Contains(apiLower, sig) {
+				// Verificar que no haya también señal válida (falso positivo)
+				hasValid := false
+				for _, vs := range validAPISignals {
+					if strings.Contains(apiLower, vs) {
+						hasValid = true
+						break
+					}
+				}
+				if !hasValid {
+					markInvalid(rawURL, fmt.Sprintf("API signal: %s", sig))
+					return
+				}
+			}
+		}
+
+		// Señales VALID en API
+		for _, sig := range validAPISignals {
+			if strings.Contains(apiLower, sig) {
+				price := extractPrice(apiBody)
+				info := CheckoutInfo{
+					URL:         rawURL,
+					Status:      StatusValid,
+					Price:       price,
+					InvoiceID:   invoiceID,
+					OrderStatus: sig,
+					LastChecked: now,
+				}
+				bufMu.Lock()
+				validBuffer = append(validBuffer, info)
+				bufMu.Unlock()
+				fmt.Printf("[VALID]   %s | API signal: %s | precio: %s\n", rawURL, sig, price)
+				return
+			}
 		}
 	}
 
-	return &http.Client{
-		Timeout:   httpTimeout,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("demasiados redirects")
-			}
-			return nil
-		},
+	// ── 2. Analizar body de la página renderizada ─────────────
+	for _, sig := range invalidBodySignals {
+		if strings.Contains(bodyLower, sig) {
+			markInvalid(rawURL, fmt.Sprintf("page signal: %q", sig))
+			return
+		}
 	}
+
+	for _, sig := range validBodySignals {
+		if strings.Contains(bodyLower, sig) {
+			price := extractPrice(bodyText)
+			info := CheckoutInfo{
+				URL:         rawURL,
+				Status:      StatusValid,
+				Price:       price,
+				InvoiceID:   invoiceID,
+				LastChecked: now,
+			}
+			bufMu.Lock()
+			validBuffer = append(validBuffer, info)
+			bufMu.Unlock()
+			fmt.Printf("[VALID]   %s | page signal: %q | precio: %s\n", rawURL, sig, price)
+			return
+		}
+	}
+
+	markUnknown(rawURL, "sin señales claras tras renderizado JS")
 }
 
 // ──────────────────────────────────────────
-//  Extrae el invoice ID de la URL
+//  Helpers
 // ──────────────────────────────────────────
 
 func extractInvoiceID(rawURL string) string {
@@ -179,232 +348,26 @@ func extractInvoiceID(rawURL string) string {
 	return ""
 }
 
-// ──────────────────────────────────────────
-//  Hace un GET y devuelve body + status code
-// ──────────────────────────────────────────
-
-func doGet(client *http.Client, rawURL string, headers map[string]string) ([]byte, int, error) {
-	req, err := http.NewRequest("GET", rawURL, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	return body, resp.StatusCode, err
-}
-
-// ──────────────────────────────────────────
-//  Check de una URL
-// ──────────────────────────────────────────
-
-func checkURL(rawURL string) {
-	if !strings.HasPrefix(rawURL, "http") {
-		rawURL = "https://" + rawURL
-	}
-
-	if _, loaded := seen.LoadOrStore(rawURL, true); loaded {
-		return
-	}
-
-	invoiceID := extractInvoiceID(rawURL)
-	if invoiceID == "" {
-		markUnknown(rawURL, "no se pudo extraer invoice ID")
-		return
-	}
-
-	client := newClient()
-	now := time.Now().Format(time.RFC3339)
-
-	baseHeaders := map[string]string{
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		"Accept":     "application/json",
-		"Referer":    rawURL,
-	}
-
-	// Añadir auth si está configurada
-	if cfg.BearerToken != "" && cfg.BearerToken != "AQUI_PON_TU_TOKEN_SI_ES_BEARER" {
-		baseHeaders["Authorization"] = "Bearer " + cfg.BearerToken
-	} else if cfg.APIKey != "" && cfg.APIKey != "AQUI_PON_TU_API_KEY" {
-		baseHeaders["Authorization"] = "Bearer " + cfg.APIKey
-	}
-
-	// ── 1. Sellix API (backend de ResellMe) ──────────────────
-	// ResellMe corre sobre Sellix. El endpoint público es:
-	// GET https://dev.sellix.io/v1/orders/{uniqid}
-	// Sin auth devuelve 401, pero con la API key del vendedor devuelve el estado.
-	// Sin API key intentamos de todas formas — algunos shops tienen órdenes públicas.
-	sellixURLs := []string{
-		fmt.Sprintf("https://dev.sellix.io/v1/orders/%s", invoiceID),
-		fmt.Sprintf("https://dev.sellix.io/v1/payments/%s", invoiceID),
-	}
-
-	for _, apiURL := range sellixURLs {
-		body, code, err := doGet(client, apiURL, baseHeaders)
-		if err != nil {
+func extractPrice(body string) string {
+	for _, ind := range []string{"€", "$", "£"} {
+		idx := strings.Index(body, ind)
+		if idx == -1 {
 			continue
 		}
-
-		if code == 404 {
-			markInvalid(rawURL, fmt.Sprintf("Sellix API 404: factura no existe (%s)", apiURL))
-			return
+		end := idx + 15
+		if end > len(body) {
+			end = len(body)
 		}
-
-		if code == 200 {
-			status, gateway, price, currency := parseSellixBody(body)
-			if status != "" {
-				handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now)
-				return
-			}
+		snippet := strings.TrimSpace(body[idx:end])
+		if i := strings.IndexAny(snippet, " \n\r\t,}\""); i > 0 {
+			snippet = snippet[:i]
 		}
-		// 401/403 = necesita auth → seguir con siguiente método
-	}
-
-	// ── 2. ResellMe API interna ───────────────────────────────
-	resellmeURLs := []string{
-		fmt.Sprintf("https://resellme.xyz/api/invoices/%s", invoiceID),
-		fmt.Sprintf("https://resellme.xyz/api/orders/%s", invoiceID),
-		fmt.Sprintf("https://resellme.xyz/api/checkout/%s", invoiceID),
-	}
-
-	for _, apiURL := range resellmeURLs {
-		hdrs := map[string]string{
-			"User-Agent":        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-			"Accept":            "application/json",
-			"Referer":           rawURL,
-			"X-Requested-With": "XMLHttpRequest",
-		}
-		body, code, err := doGet(client, apiURL, hdrs)
-		if err != nil {
-			continue
-		}
-		bodyLower := strings.ToLower(string(body))
-
-		if code == 404 {
-			markInvalid(rawURL, "ResellMe API: no encontrado")
-			return
-		}
-
-		if code == 200 {
-			if strings.Contains(bodyLower, `"completed"`) || strings.Contains(bodyLower, `"paid"`) ||
-				strings.Contains(bodyLower, "entregado") || strings.Contains(bodyLower, "delivered") {
-				bufMu.Lock()
-				validBuffer = append(validBuffer, CheckoutInfo{
-					URL: rawURL, Status: StatusValid,
-					Method: "Resellme", InvoiceID: invoiceID, LastChecked: now,
-				})
-				bufMu.Unlock()
-				fmt.Printf("[VALID]   %s | ResellMe API positiva\n", rawURL)
-				return
-			}
-			if strings.Contains(bodyLower, "no encontrada") || strings.Contains(bodyLower, "not found") ||
-				strings.Contains(bodyLower, "invalid") {
-				markInvalid(rawURL, "ResellMe API: factura no encontrada")
-				return
-			}
+		if len(snippet) > 1 {
+			return snippet
 		}
 	}
-
-	// ── 3. Fallback: GET página HTML y buscar señales SSR ─────
-	htmlHdrs := map[string]string{
-		"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-	}
-	body, code, err := doGet(client, rawURL, htmlHdrs)
-	if err != nil {
-		fmt.Printf("[DEAD]    %s | %v\n", rawURL, err)
-		return
-	}
-
-	if code == 404 || code == 410 {
-		markInvalid(rawURL, fmt.Sprintf("HTTP %d", code))
-		return
-	}
-
-	bodyLower := strings.ToLower(string(body))
-
-	negatives := []string{"factura no encontrada", "invoice not found", "order not found", "checkout expired"}
-	for _, sig := range negatives {
-		if strings.Contains(bodyLower, sig) {
-			markInvalid(rawURL, fmt.Sprintf("señal HTML: %q", sig))
-			return
-		}
-	}
-
-	positives := []string{"completed", "entregado", "su pedido se ha realizado", "order completed", "paid"}
-	for _, sig := range positives {
-		if strings.Contains(bodyLower, sig) {
-			bufMu.Lock()
-			validBuffer = append(validBuffer, CheckoutInfo{
-				URL: rawURL, Status: StatusValid,
-				Method: "Resellme", InvoiceID: invoiceID, LastChecked: now,
-			})
-			bufMu.Unlock()
-			fmt.Printf("[VALID]   %s | señal HTML: %q\n", rawURL, sig)
-			return
-		}
-	}
-
-	// SPA pura — no se puede determinar sin JS
-	// SOLUCIÓN: pon tu API key de Sellix (del vendedor) en config.json como bearer_token
-	markUnknown(rawURL, "SPA pura. SOLUCIÓN: pon la API key de Sellix del vendedor en config.json como bearer_token")
+	return ""
 }
-
-// ──────────────────────────────────────────
-//  Parsea respuesta Sellix y devuelve campos clave
-// ──────────────────────────────────────────
-
-func parseSellixBody(body []byte) (status, gateway, price, currency string) {
-	var result SellixResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return
-	}
-	// Puede estar en .data.invoice o .data.order
-	if result.Data.Invoice.Status != "" {
-		inv := result.Data.Invoice
-		status = strings.ToUpper(inv.Status)
-		gateway = inv.Gateway
-		price = fmt.Sprintf("%.2f", inv.TotalDisplay)
-		currency = inv.Currency
-	} else if result.Data.Order.Status != "" {
-		ord := result.Data.Order
-		status = strings.ToUpper(ord.Status)
-		gateway = ord.Gateway
-		price = fmt.Sprintf("%.2f", ord.TotalDisplay)
-		currency = ord.Currency
-	}
-	return
-}
-
-func handleSellixStatus(rawURL, invoiceID, status, gateway, price, currency, now string) {
-	priceStr := fmt.Sprintf("%s %s", price, currency)
-	switch status {
-	case "COMPLETED":
-		bufMu.Lock()
-		validBuffer = append(validBuffer, CheckoutInfo{
-			URL: rawURL, Status: StatusValid,
-			Method: gateway, Price: priceStr,
-			InvoiceID: invoiceID, OrderStatus: status, LastChecked: now,
-		})
-		bufMu.Unlock()
-		fmt.Printf("[VALID]   %s | %s | %s | %s\n", rawURL, status, gateway, priceStr)
-	case "VOIDED", "CANCELLED", "EXPIRED":
-		markInvalid(rawURL, fmt.Sprintf("Sellix status: %s", status))
-	default:
-		markUnknown(rawURL, fmt.Sprintf("Sellix status: %s", status))
-	}
-}
-
-// ──────────────────────────────────────────
-//  Helpers
-// ──────────────────────────────────────────
 
 func markInvalid(rawURL, reason string) {
 	bufMu.Lock()
@@ -446,43 +409,6 @@ func flushBuffers() {
 		appendLines(unknownFile, ub)
 		fmt.Printf("[FLUSH] %d desconocidos → %s\n", len(ub), unknownFile)
 	}
-}
-
-// ──────────────────────────────────────────
-//  Config y proxies
-// ──────────────────────────────────────────
-
-func loadConfig() {
-	f, err := os.Open(configFile)
-	if err != nil {
-		fmt.Println("[INFO] config.json no encontrado, sin auth")
-		return
-	}
-	defer f.Close()
-	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
-		fmt.Println("[WARN] Error parseando config.json:", err)
-	} else {
-		fmt.Println("[INFO] config.json cargado")
-	}
-}
-
-func loadProxies() {
-	lines, err := loadLines(proxiesFile)
-	if err != nil || len(lines) == 0 {
-		fmt.Println("[INFO] proxies.txt vacío, sin proxies")
-		return
-	}
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l == "" || strings.HasPrefix(l, "#") {
-			continue
-		}
-		if !strings.HasPrefix(l, "http") && !strings.HasPrefix(l, "socks") {
-			l = "http://" + l
-		}
-		proxies = append(proxies, l)
-	}
-	fmt.Printf("[INFO] %d proxies cargados\n", len(proxies))
 }
 
 // ──────────────────────────────────────────
